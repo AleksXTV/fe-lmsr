@@ -1,0 +1,5 @@
+fixture,function,fe_sonatina,sol,sol_opt,sol_ir,sol_ir_opt,sol_best,delta_fe_sonatina_vs_sol_best_pct
+lmsr,quoteBuy2,28489,34338,29845,69607,28696,28696,-0.72
+lmsr,quoteBuy2,28670,34514,30021,69804,28884,28884,-0.74
+lmsr,quoteBuy4,34057,41827,35262,109470,33562,33562,1.47
+lmsr,price4,28007,30224,27451,64904,26953,26953,3.91

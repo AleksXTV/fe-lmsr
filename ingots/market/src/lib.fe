@@ -1,0 +1,521 @@
+//! LMSR prediction markets settled in ETH.
+//!
+//! One generic market core, `Book<N>` plus the functions below, serves every
+//! outcome count from 2 to 16. `BinaryMarket` and `CategoricalMarket4` are two
+//! instantiations; their handlers only forward to the core. The outcome bound
+//! is a const predicate, so `Book<1>` or `Book<17>` does not compile.
+//!
+//! Units: one share of the winning outcome pays 1 ether. Share amounts are
+//! 18-decimal `Wad`s whose raw value equals the wei they can pay out.
+//!
+//! Solvency: buyers pay at least the true LMSR cost difference and sellers
+//! receive at most it (see `lmsr::Lmsr`), and the sponsor funds the market
+//! with an upper bound on `C(0) = b ln N`. Since `C(q) >= max_i q_i`, the
+//! contract can then always pay every share of whichever outcome wins. Every
+//! state-changing handler re-checks that invariant against its real balance
+//! before it returns.
+use lmsr::{Lmsr, MAX_SHARES}
+use core::fixed::Wad
+use std::evm::{Address, Call, Ctx, Log, StorageMap, revert_error, wei}
+
+/// Market state shared by all outcome counts.
+pub struct Book<const N: usize> where N >= 2, N <= 16 {
+    pub b: Wad,
+    pub q: [Wad; N],
+    pub oracle: Address,
+    pub sponsor: Address,
+    pub resolved: bool,
+    pub winner: u8,
+    /// Winning shares not redeemed yet (set at resolution).
+    pub owed: Wad,
+}
+
+/// Shares held per (trader, outcome).
+type Holdings = StorageMap<(Address, u8), Wad>
+
+msg MarketMsg {
+    #[selector = sol("buy(uint8,uint256,uint256)")]
+    Buy { outcome: u8, shares: u256, max_cost: u256 } -> u256,
+    #[selector = sol("sell(uint8,uint256,uint256)")]
+    Sell { outcome: u8, shares: u256, min_return: u256 } -> u256,
+    #[selector = sol("resolve(uint8)")]
+    Resolve { outcome: u8 },
+    #[selector = sol("redeem()")]
+    Redeem -> u256,
+    #[selector = sol("sweep(address)")]
+    Sweep { to: Address } -> u256,
+    #[selector = sol("price(uint8)")]
+    Price { outcome: u8 } -> u256,
+    #[selector = sol("quoteBuy(uint8,uint256)")]
+    QuoteBuy { outcome: u8, shares: u256 } -> u256,
+    #[selector = sol("quoteSell(uint8,uint256)")]
+    QuoteSell { outcome: u8, shares: u256 } -> u256,
+    #[selector = sol("sharesOf(address,uint8)")]
+    SharesOf { owner: Address, outcome: u8 } -> u256,
+    #[selector = sol("outstanding(uint8)")]
+    Outstanding { outcome: u8 } -> u256,
+    #[selector = sol("liquidity()")]
+    Liquidity -> u256,
+    #[selector = sol("outcomes()")]
+    Outcomes -> u256,
+}
+
+#[event]
+pub struct Bought {
+    #[indexed]
+    pub trader: Address,
+    pub outcome: u8,
+    pub shares: u256,
+    pub cost: u256,
+}
+
+#[event]
+pub struct Sold {
+    #[indexed]
+    pub trader: Address,
+    pub outcome: u8,
+    pub shares: u256,
+    pub payout: u256,
+}
+
+#[event]
+pub struct Resolved { pub outcome: u8 }
+
+#[event]
+pub struct Redeemed {
+    #[indexed]
+    pub owner: Address,
+    pub amount: u256,
+}
+
+#[error]
+pub struct SlippageExceeded { pub limit: u256, pub actual: u256 }
+
+#[error]
+pub struct InsufficientPayment { pub required: u256, pub sent: u256 }
+
+#[error]
+pub struct InsufficientShares { pub held: u256, pub requested: u256 }
+
+#[error]
+pub struct BadOutcome { pub outcome: u8 }
+
+#[error]
+pub struct MarketClosed {}
+
+#[error]
+pub struct NotResolved {}
+
+#[error]
+pub struct Unauthorized {}
+
+#[error]
+pub struct Underfunded { pub required: u256, pub sent: u256 }
+
+#[error]
+pub struct TransferFailed {}
+
+#[error]
+pub struct ZeroAmount {}
+
+#[error]
+pub struct TooManyShares {}
+
+/// Broken solvency invariant. Unreachable unless the math is wrong; it exists so
+/// that a bug reverts the trade instead of leaving the market short.
+#[error]
+pub struct Insolvent { pub balance: u256, pub liability: u256 }
+
+fn maker<const N: usize>() -> Lmsr<N>
+uses (book: Book<N>) where N >= 2, N <= 16
+{
+    Lmsr<N>::new(b: book.b)
+}
+
+fn check_outcome<const N: usize>(_ outcome: u8) where N >= 2, N <= 16 {
+    if outcome as usize >= N {
+        revert_error(BadOutcome { outcome })
+    }
+}
+
+fn check_open<const N: usize>() uses (book: Book<N>) where N >= 2, N <= 16 {
+    if book.resolved {
+        revert_error(MarketClosed {})
+    }
+}
+
+/// Sends ETH with all remaining gas, so contract wallets can receive it. Every
+/// caller updates its state before paying, so a reentrant call sees the new
+/// state (tested in `reentrant_sell_during_refund_sees_updated_state`).
+fn pay(_ to: Address, _ amount: Wad) uses (call: mut Call, ctx: Ctx) {
+    if amount.is_zero() { return }
+    if !call.send_value(addr: to, gas: ctx.gas(), value: wei(amount.raw())).success() {
+        revert_error(TransferFailed {})
+    }
+}
+
+/// The most the market can owe: before resolution, every share of the outcome
+/// with the most shares; after it, the unredeemed winning shares.
+pub fn liability<const N: usize>() -> Wad
+uses (book: Book<N>) where N >= 2, N <= 16
+{
+    if book.resolved {
+        return book.owed
+    }
+    var worst = Wad::zero()
+    for x in book.q {
+        worst = worst.max(x)
+    }
+    worst
+}
+
+fn check_solvent<const N: usize>()
+uses (book: Book<N>, ctx: Ctx) where N >= 2, N <= 16
+{
+    let balance = ctx.balance(ctx.address()).as_wei()
+    let owed = liability<N>().raw()
+    if balance < owed {
+        revert_error(Insolvent { balance, liability: owed })
+    }
+}
+
+pub fn open<const N: usize>(b: Wad, oracle: Address)
+uses (book: mut Book<N>, ctx: Ctx) where N >= 2, N <= 16
+{
+    let m = Lmsr<N>::new(b: b)
+    let need = m.funding().raw()
+    let sent = ctx.value().as_wei()
+    if sent < need {
+        revert_error(Underfunded { required: need, sent })
+    }
+    book.b = b
+    book.oracle = oracle
+    book.sponsor = ctx.caller()
+}
+
+pub fn buy<const N: usize>(outcome: u8, shares: Wad, max_cost: Wad) -> Wad
+uses (book: mut Book<N>, holdings: mut Holdings, ctx: Ctx, call: mut Call, log: mut Log)
+where N >= 2, N <= 16
+{
+    check_open<N>()
+    check_outcome<N>(outcome)
+    if shares.is_zero() {
+        revert_error(ZeroAmount {})
+    }
+    let i = outcome as usize
+    if book.q[i] + shares > MAX_SHARES {
+        revert_error(TooManyShares {})
+    }
+    let cost = maker<N>().buy_cost(book.q, i: i, shares: shares)
+    if cost > max_cost {
+        revert_error(
+            SlippageExceeded { limit: max_cost.raw(), actual: cost.raw() },
+        )
+    }
+    let sent = Wad::from_raw(ctx.value().as_wei())
+    if sent < cost {
+        revert_error(
+            InsufficientPayment { required: cost.raw(), sent: sent.raw() },
+        )
+    }
+    let trader = ctx.caller()
+    // Effects before the refund, so a reentrant call sees the new state.
+    book.q[i] = book.q[i] + shares
+    holdings.set(
+            key: (trader, outcome),
+            value: holdings.get((trader, outcome)) + shares,
+        )
+    log.emit(
+        Bought { trader, outcome, shares: shares.raw(), cost: cost.raw() },
+    )
+    pay(trader, sent - cost)
+    check_solvent<N>()
+    cost
+}
+
+pub fn sell<const N: usize>(outcome: u8, shares: Wad, min_return: Wad) -> Wad
+uses (book: mut Book<N>, holdings: mut Holdings, ctx: Ctx, call: mut Call, log: mut Log)
+where N >= 2, N <= 16
+{
+    check_open<N>()
+    check_outcome<N>(outcome)
+    if shares.is_zero() {
+        revert_error(ZeroAmount {})
+    }
+    let trader = ctx.caller()
+    let held = holdings.get((trader, outcome))
+    if held < shares {
+        revert_error(
+            InsufficientShares { held: held.raw(), requested: shares.raw() },
+        )
+    }
+    let i = outcome as usize
+    let payout = maker<N>().sell_return(book.q, i: i, shares: shares)
+    if payout < min_return {
+        revert_error(
+            SlippageExceeded { limit: min_return.raw(), actual: payout.raw() },
+        )
+    }
+    book.q[i] = book.q[i] - shares
+    holdings.set(key: (trader, outcome), value: held - shares)
+    log.emit(
+        Sold { trader, outcome, shares: shares.raw(), payout: payout.raw() },
+    )
+    pay(trader, payout)
+    check_solvent<N>()
+    payout
+}
+
+pub fn resolve<const N: usize>(outcome: u8)
+uses (book: mut Book<N>, ctx: Ctx, log: mut Log) where N >= 2, N <= 16
+{
+    if ctx.caller() != book.oracle {
+        revert_error(Unauthorized {})
+    }
+    check_open<N>()
+    check_outcome<N>(outcome)
+    book.resolved = true
+    book.winner = outcome
+    book.owed = book.q[outcome as usize]
+    log.emit(Resolved { outcome })
+    check_solvent<N>()
+}
+
+pub fn redeem<const N: usize>() -> Wad
+uses (book: mut Book<N>, holdings: mut Holdings, ctx: Ctx, call: mut Call, log: mut Log)
+where N >= 2, N <= 16
+{
+    if !book.resolved {
+        revert_error(NotResolved {})
+    }
+    let owner = ctx.caller()
+    let key = (owner, book.winner)
+    let amount = holdings.get(key)
+    if amount.is_zero() {
+        revert_error(ZeroAmount {})
+    }
+    holdings.set(key: key, value: Wad::zero())
+    book.owed = book.owed - amount
+    log.emit(Redeemed { owner, amount: amount.raw() })
+    pay(owner, amount)
+    check_solvent<N>()
+    amount
+}
+
+/// After resolution, the sponsor takes back everything the winners are not owed.
+pub fn sweep<const N: usize>(to: Address) -> Wad
+uses (book: Book<N>, ctx: Ctx, call: mut Call) where N >= 2, N <= 16
+{
+    if !book.resolved {
+        revert_error(NotResolved {})
+    }
+    if ctx.caller() != book.sponsor {
+        revert_error(Unauthorized {})
+    }
+    let balance = Wad::from_raw(ctx.balance(ctx.address()).as_wei())
+    let surplus = balance - book.owed
+    pay(to, surplus)
+    check_solvent<N>()
+    surplus
+}
+
+pub fn price<const N: usize>(outcome: u8) -> Wad
+uses (book: Book<N>) where N >= 2, N <= 16
+{
+    check_outcome<N>(outcome)
+    maker<N>().price(book.q, i: outcome as usize)
+}
+
+pub fn quote_buy<const N: usize>(outcome: u8, shares: Wad) -> Wad
+uses (book: Book<N>)
+where N >= 2, N <= 16
+{
+    check_outcome<N>(outcome)
+    maker<N>().buy_cost(book.q, i: outcome as usize, shares: shares)
+}
+
+pub fn quote_sell<const N: usize>(outcome: u8, shares: Wad) -> Wad
+uses (book: Book<N>)
+where N >= 2, N <= 16
+{
+    check_outcome<N>(outcome)
+    let i = outcome as usize
+    if shares > book.q[i] {
+        return Wad::zero()
+    }
+    maker<N>().sell_return(book.q, i: i, shares: shares)
+}
+
+/// A yes/no market.
+pub contract BinaryMarket uses (ctx: Ctx, call: mut Call, log: mut Log) {
+    mut book: Book<2>,
+    mut holdings: Holdings,
+
+    /// `b` is the LMSR liquidity parameter as an 18-decimal number; the
+    /// deployer must send at least `b * ln 2` (see `funding`).
+    #[payable]
+    init(b: u256, oracle: Address)
+    uses (mut book, ctx)
+    {
+        with (book) {
+            open<2>(b: Wad::from_raw(b), oracle: oracle)
+        }
+    }
+
+    recv MarketMsg {
+        #[payable]
+        Buy { outcome, shares, max_cost } -> u256
+        uses (mut book, mut holdings, ctx, mut call, mut log)
+        {
+            with (book, holdings) {
+                buy<2>(
+                    outcome: outcome,
+                    shares: Wad::from_raw(shares),
+                    max_cost: Wad::from_raw(max_cost),
+                )
+                    .raw()
+            }
+        }
+        Sell { outcome, shares, min_return } -> u256
+        uses (mut book, mut holdings, ctx, mut call, mut log)
+        {
+            with (book, holdings) {
+                sell<2>(
+                    outcome: outcome,
+                    shares: Wad::from_raw(shares),
+                    min_return: Wad::from_raw(min_return),
+                )
+                    .raw()
+            }
+        }
+        Resolve { outcome } uses (mut book, ctx, mut log) {
+            with (book) {
+                resolve<2>(outcome: outcome)
+            }
+        }
+        Redeem -> u256 uses (mut book, mut holdings, ctx, mut call, mut log) {
+            with (book, holdings) {
+                redeem<2>().raw()
+            }
+        }
+        Sweep { to } -> u256 uses (book, ctx, mut call) {
+            with (book) {
+                sweep<2>(to: to).raw()
+            }
+        }
+        Price { outcome } -> u256 uses (book) {
+            with (book) {
+                price<2>(outcome: outcome).raw()
+            }
+        }
+        QuoteBuy { outcome, shares } -> u256 uses (book) {
+            with (book) {
+                quote_buy<2>(outcome: outcome, shares: Wad::from_raw(shares)).raw()
+            }
+        }
+        QuoteSell { outcome, shares } -> u256 uses (book) {
+            with (book) {
+                quote_sell<2>(outcome: outcome, shares: Wad::from_raw(shares)).raw()
+            }
+        }
+        SharesOf { owner, outcome } -> u256 uses (holdings) {
+            holdings.get((owner, outcome)).raw()
+        }
+        Outstanding { outcome } -> u256 uses (book) {
+            check_outcome<2>(outcome)
+            book.q[outcome as usize].raw()
+        }
+        Liquidity -> u256 uses (book) {
+            book.b.raw()
+        }
+        Outcomes -> u256 {
+            2
+        }
+    }
+}
+
+/// A market with four mutually exclusive outcomes.
+pub contract CategoricalMarket4 uses (ctx: Ctx, call: mut Call, log: mut Log) {
+    mut book: Book<4>,
+    mut holdings: Holdings,
+
+    #[payable]
+    init(b: u256, oracle: Address)
+    uses (mut book, ctx)
+    {
+        with (book) {
+            open<4>(b: Wad::from_raw(b), oracle: oracle)
+        }
+    }
+
+    recv MarketMsg {
+        #[payable]
+        Buy { outcome, shares, max_cost } -> u256
+        uses (mut book, mut holdings, ctx, mut call, mut log)
+        {
+            with (book, holdings) {
+                buy<4>(
+                    outcome: outcome,
+                    shares: Wad::from_raw(shares),
+                    max_cost: Wad::from_raw(max_cost),
+                )
+                    .raw()
+            }
+        }
+        Sell { outcome, shares, min_return } -> u256
+        uses (mut book, mut holdings, ctx, mut call, mut log)
+        {
+            with (book, holdings) {
+                sell<4>(
+                    outcome: outcome,
+                    shares: Wad::from_raw(shares),
+                    min_return: Wad::from_raw(min_return),
+                )
+                    .raw()
+            }
+        }
+        Resolve { outcome } uses (mut book, ctx, mut log) {
+            with (book) {
+                resolve<4>(outcome: outcome)
+            }
+        }
+        Redeem -> u256 uses (mut book, mut holdings, ctx, mut call, mut log) {
+            with (book, holdings) {
+                redeem<4>().raw()
+            }
+        }
+        Sweep { to } -> u256 uses (book, ctx, mut call) {
+            with (book) {
+                sweep<4>(to: to).raw()
+            }
+        }
+        Price { outcome } -> u256 uses (book) {
+            with (book) {
+                price<4>(outcome: outcome).raw()
+            }
+        }
+        QuoteBuy { outcome, shares } -> u256 uses (book) {
+            with (book) {
+                quote_buy<4>(outcome: outcome, shares: Wad::from_raw(shares)).raw()
+            }
+        }
+        QuoteSell { outcome, shares } -> u256 uses (book) {
+            with (book) {
+                quote_sell<4>(outcome: outcome, shares: Wad::from_raw(shares)).raw()
+            }
+        }
+        SharesOf { owner, outcome } -> u256 uses (holdings) {
+            holdings.get((owner, outcome)).raw()
+        }
+        Outstanding { outcome } -> u256 uses (book) {
+            check_outcome<4>(outcome)
+            book.q[outcome as usize].raw()
+        }
+        Liquidity -> u256 uses (book) {
+            book.b.raw()
+        }
+        Outcomes -> u256 {
+            4
+        }
+    }
+}

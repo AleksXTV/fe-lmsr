@@ -1,0 +1,7 @@
+use lmsr::Lmsr
+use core::fixed::Wad
+
+pub fn one_outcome() -> Wad {
+    let m: Lmsr<1> = Lmsr<1>::new(b: Wad::from_raw(1000000000000000000))
+    m.b
+}

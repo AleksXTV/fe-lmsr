@@ -1,0 +1,177 @@
+// Randomised trading campaigns against deployed markets (a stateful fuzz test).
+//
+// Three trader contracts buy and sell at random through the `Rng` effect. After
+// every trade the test checks, against the real contract:
+//   * accounting: market balance == funding + everything paid in - everything paid out
+//   * holdings:   the traders' shares of each outcome add up to `outstanding`
+//   * solvency:   market balance >= the largest `outstanding` (any outcome can be paid)
+// Then a random outcome wins, every holder redeems exactly their winning shares and
+// the sponsor sweeps the rest, leaving the market empty.
+use ingot::{BinaryMarket, CategoricalMarket4, MarketMsg}
+use ingot::tests::{Trader, TraderMsg}
+use std::evm::{Address, Evm, wei}
+use std::evm::random::{KeccakRng, Rng}
+
+const E18: u256 = 1_000_000_000_000_000_000
+const TRADERS: usize = 3
+
+fn quote_buy(_ market: Address, outcome: u8, shares: u256) -> u256
+uses (evm: mut Evm)
+{
+    evm.call(
+        addr: market,
+        gas: 3000000,
+        value: wei(0),
+        message: MarketMsg::QuoteBuy { outcome, shares },
+    )
+}
+
+fn quote_sell(_ market: Address, outcome: u8, shares: u256) -> u256
+uses (evm: mut Evm)
+{
+    evm.call(
+        addr: market,
+        gas: 3000000,
+        value: wei(0),
+        message: MarketMsg::QuoteSell { outcome, shares },
+    )
+}
+
+fn outstanding(_ market: Address, outcome: u8) -> u256 uses (evm: mut Evm) {
+    evm.call(
+        addr: market,
+        gas: 3000000,
+        value: wei(0),
+        message: MarketMsg::Outstanding { outcome },
+    )
+}
+
+fn campaign(market: Address, n: u256, b: u256, funding: u256, steps: u256)
+uses (evm: mut Evm, rng: mut Rng)
+{
+    var traders: [Address; 3] = [Address::new(0); 3]
+    var k: usize = 0
+    while k < TRADERS {
+        traders[k] = evm.create2<Trader>(value: wei(0), args: (), salt: 100 + k as u256)
+        k += 1
+    }
+    let oracle = evm.create2<Trader>(value: wei(0), args: (), salt: 99)
+    let _ = oracle
+    // held[t * 4 + o]
+    var held: [u256; 12] = [0; 12]
+    var paid_in: u256 = 0
+    var paid_out: u256 = 0
+    var step: u256 = 0
+    while step < steps {
+        let t = rng.uniform(TRADERS as u256) as usize
+        let o: u8 = rng.uniform(n).downcast_truncate()
+        let slot = t * 4 + o as usize
+        if rng.chance(numerator: 65, denominator: 100) || held[slot] == 0 {
+            let shares = rng.uniform(b * 2) + 1
+            let quote = quote_buy(market, outcome: o, shares: shares)
+            let extra = rng.uniform(E18)
+            let cost: u256 = evm
+                .call(
+                    addr: traders[t],
+                    gas: 8000000,
+                    value: wei(quote + extra),
+                    message: TraderMsg::Buy { market, outcome: o, shares, max_cost: quote },
+                )
+            assert!(cost == quote)
+            held[slot] += shares
+            paid_in += cost
+        } else {
+            let shares = rng.uniform(held[slot]) + 1
+            let quote = quote_sell(market, outcome: o, shares: shares)
+            let got: u256 = evm
+                .call(
+                    addr: traders[t],
+                    gas: 8000000,
+                    value: wei(0),
+                    message: TraderMsg::Sell { market, outcome: o, shares, min_return: quote },
+                )
+            assert!(got == quote)
+            held[slot] -= shares
+            paid_out += got
+        }
+        // invariants
+        let balance = evm.balance(market).as_wei()
+        assert!(balance == funding + paid_in - paid_out)
+        var worst: u256 = 0
+        var j: u256 = 0
+        while j < n {
+            let out = outstanding(market, outcome: j.downcast_truncate())
+            var sum: u256 = 0
+            var u: usize = 0
+            while u < TRADERS {
+                sum += held[u * 4 + j as usize]
+                u += 1
+            }
+            assert!(out == sum)
+            if out > worst { worst = out }
+            j += 1
+        }
+        assert!(balance >= worst)
+        step += 1
+    }
+
+    // Resolution: the market was deployed with this test as oracle.
+    let winner: u8 = rng.uniform(n).downcast_truncate()
+    let _: () = evm
+        .call(
+            addr: market,
+            gas: 3000000,
+            value: wei(0),
+            message: MarketMsg::Resolve { outcome: winner },
+        )
+    var u: usize = 0
+    while u < TRADERS {
+        let due = held[u * 4 + winner as usize]
+        if due > 0 {
+            let before = evm.balance(traders[u]).as_wei()
+            let got: u256 = evm
+                .call(
+                    addr: traders[u],
+                    gas: 8000000,
+                    value: wei(0),
+                    message: TraderMsg::Redeem { market },
+                )
+            assert!(got == due)
+            assert!(evm.balance(traders[u]).as_wei() == before + due)
+            paid_out += got
+        }
+        u += 1
+    }
+    let treasury = Address::new(0x7ea5 + n)
+    let surplus: u256 = evm
+        .call(
+            addr: market,
+            gas: 3000000,
+            value: wei(0),
+            message: MarketMsg::Sweep { to: treasury },
+        )
+    assert!(surplus == funding + paid_in - paid_out)
+    assert!(evm.balance(market).as_wei() == 0)
+}
+
+#[test(balance = 100_000_000_000_000_000_000_000_000)]
+fn fuzz_binary_market_campaign() uses (evm: mut Evm) {
+    let b: u256 = 50 * E18
+    let funding: u256 = 35 * E18 // b ln 2 = 34.66
+    let m = evm.create2<BinaryMarket>(value: wei(funding), args: (b, evm.address()), salt: 0)
+    var rng = KeccakRng::seeded(0xb1)
+    with (Rng = rng) {
+        campaign(market: m, n: 2, b: b, funding: funding, steps: 120)
+    }
+}
+
+#[test(balance = 100_000_000_000_000_000_000_000_000)]
+fn fuzz_categorical_market_campaign() uses (evm: mut Evm) {
+    let b: u256 = 20 * E18
+    let funding: u256 = 28 * E18 // b ln 4 = 27.73
+    let m = evm.create2<CategoricalMarket4>(value: wei(funding), args: (b, evm.address()), salt: 0)
+    var rng = KeccakRng::seeded(0xc4)
+    with (Rng = rng) {
+        campaign(market: m, n: 4, b: b, funding: funding, steps: 120)
+    }
+}

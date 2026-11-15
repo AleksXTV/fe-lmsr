@@ -1,0 +1,115 @@
+//! Logarithmic market scoring rule (Hanson, 2003) on 18-decimal fixed point.
+//!
+//! For outstanding shares `q` and liquidity `b`, the cost function is
+//! `C(q) = b * ln(sum_i exp(q_i / b))`. Buying `x` shares of outcome `i` costs
+//! `C(q + x * e_i) - C(q)`; the price of outcome `i` is its softmax weight.
+//!
+//! `C` is computed stably as `b * (m + ln(sum_i exp(q_i / b - m)))` with
+//! `m = max_i q_i / b`, so every `exp` argument is at most zero.
+//!
+//! Fixed-point `exp` and `ln` are approximations, so the *computed* cost can be a
+//! few wei away from the true one. A market maker that charged the computed
+//! difference could be drained by rounding. This module never does that: it
+//! brackets the true cost between `cost_lower` and `cost_upper`, charges buyers
+//! `cost_upper(after) - cost_lower(before)` and pays sellers
+//! `cost_lower(before) - cost_upper(after)`. Every trade then pays the market at
+//! least the true cost difference, which is what makes the market solvent.
+use core::fixed::{SWad, Wad}
+
+/// An LMSR market maker with `N` outcomes and liquidity parameter `b`.
+///
+/// The outcome count is part of the type and is checked at compile time.
+pub struct Lmsr<const N: usize> where N >= 2, N <= 16 { pub b: Wad }
+
+impl<const N: usize> Copy for Lmsr<N> {}
+
+/// Smallest supported liquidity parameter, 0.001.
+pub const MIN_B: Wad = Wad::from_ratio(1, 1000)
+/// Largest supported liquidity parameter, 10^12.
+pub const MAX_B: Wad = Wad::from_int(1_000_000_000_000)
+/// Largest supported share count per outcome, 10^15. With `b >= MIN_B` this keeps
+/// `q_i / b` far below the range where `exp` would overflow.
+pub const MAX_SHARES: Wad = Wad::from_int(1_000_000_000_000_000)
+
+impl<const N: usize> Lmsr<N> {
+    pub fn new(b: Wad) -> Self {
+        assert!(b >= MIN_B && b <= MAX_B, "liquidity out of range")
+        Lmsr { b }
+    }
+
+    /// The computed (approximate) cost `C(q)`.
+    pub fn cost(self, _ q: [Wad; N]) -> Wad {
+        let m = self.max_ratio(q)
+        let s = self.shifted_sum(q, m: m)
+        self.b * (m + s.ln().to_unsigned())
+    }
+
+    /// Bound on `|cost(q) - C(q)|`, in raw (wei) units.
+    ///
+    /// Each `q_i / b` rounds down by under 1 wei (in units of `q / b`), each `exp`
+    /// and the `ln` are within a few wei of exact, and multiplying by `b` scales
+    /// those errors by `b`. The bound below covers all of them with a wide
+    /// margin; `src/vectors.fe` and `tools/difftest.py` check it against 60-digit references.
+    pub fn error_bound(self) -> Wad {
+        Wad::from_raw(
+            (self.b.raw() / 1_000_000_000_000_000_000 + 1) * (N as u256 + 8) * 4 + 64,
+        )
+    }
+
+    pub fn cost_upper(self, _ q: [Wad; N]) -> Wad {
+        self.cost(q) + self.error_bound()
+    }
+
+    pub fn cost_lower(self, _ q: [Wad; N]) -> Wad {
+        self.cost(q).saturating_sub(self.error_bound())
+    }
+
+    /// Collateral the market maker must hold before the first trade: an upper
+    /// bound on `C(0) = b * ln(N)`, which is also its worst-case loss.
+    pub fn funding(self) -> Wad {
+        self.cost_upper([Wad::zero(); N])
+    }
+
+    /// Price (probability) of outcome `i`, rounded down.
+    pub fn price(self, _ q: [Wad; N], i: usize) -> Wad {
+        let m = self.max_ratio(q)
+        let s = self.shifted_sum(q, m: m)
+        self.weight(q[i], m: m) / s
+    }
+
+    /// What buying `shares` of outcome `i` costs, rounded in the market's favour.
+    pub fn buy_cost(self, _ q: [Wad; N], i: usize, shares: Wad) -> Wad {
+        var after = q
+        after[i] = after[i] + shares
+        self.cost_upper(after).saturating_sub(self.cost_lower(q))
+    }
+
+    /// What selling `shares` of outcome `i` returns, rounded in the market's favour.
+    pub fn sell_return(self, _ q: [Wad; N], i: usize, shares: Wad) -> Wad {
+        var after = q
+        after[i] = after[i] - shares
+        self.cost_lower(q).saturating_sub(self.cost_upper(after))
+    }
+
+    fn max_ratio(self, _ q: [Wad; N]) -> Wad {
+        var m = Wad::zero()
+        for x in q {
+            let r = x / self.b
+            if r > m { m = r }
+        }
+        m
+    }
+
+    fn weight(self, _ x: Wad, m: Wad) -> Wad {
+        let d: SWad = (x / self.b).to_signed() - m.to_signed()
+        d.exp()
+    }
+
+    fn shifted_sum(self, _ q: [Wad; N], m: Wad) -> Wad {
+        var s = Wad::zero()
+        for x in q {
+            s = s + self.weight(x, m: m)
+        }
+        s
+    }
+}

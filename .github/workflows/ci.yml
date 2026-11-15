@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  FE_VERSION: v26.5.1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Fe
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/argotorg/fe/master/feup/feup.sh | bash -s -- --version "$FE_VERSION" --no-modify-path
+          echo "$HOME/.fe/bin" >> "$GITHUB_PATH"
+      - run: fe --version
+      - run: fe fmt --check ingots
+      - run: fe test
+      - run: fe build
+      - name: Const-generic bound rejects Lmsr<1> at compile time
+        run: "! fe check examples/compile-fail"
+      - name: Differential test against a 60-digit reference
+        run: |
+          fe build --backend native --out-dir ingots/lmsr-cli/out ingots/lmsr-cli
+          python3 tools/difftest.py --cases 20000 --vectors 0
+      - name: Gas benchmark vs Solidity (Solady)
+        run: |
+          curl -fsSL -o solc https://github.com/ethereum/solidity/releases/download/v0.8.28/solc-static-linux
+          chmod +x solc
+          fe bench bench --solc ./solc

@@ -1,0 +1,8 @@
+[workspace]
+name = "fe-lmsr"
+version = "0.1.0"
+members = [
+  { path = "ingots/lmsr", name = "lmsr" },
+  { path = "ingots/market", name = "market" },
+  { path = "ingots/lmsr-cli", name = "lmsr_cli" },
+]

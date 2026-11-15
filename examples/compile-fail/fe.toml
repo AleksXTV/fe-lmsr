@@ -1,0 +1,8 @@
+# Deliberately does NOT compile: `Lmsr<1>` violates `where N >= 2`.
+# Run `fe check examples/compile-fail` to see the compiler reject it.
+[ingot]
+name = "compile_fail"
+version = "0.1.0"
+
+[dependencies]
+lmsr = { path = "../../ingots/lmsr" }

@@ -1,0 +1,373 @@
+use ingot::{
+    BinaryMarket,
+    CategoricalMarket4,
+    MarketMsg,
+    SlippageExceeded,
+    Unauthorized,
+    MarketClosed,
+    InsufficientShares,
+    BadOutcome,
+    Underfunded,
+}
+use std::evm::{Address, Call, Ctx, Evm, ether, is_error, wei}
+
+const E18: u256 = 1_000_000_000_000_000_000
+const B: u256 = 100 * E18
+// b ln 2 = 69.31... ether, plus the error margin
+const FUND: u256 = 70 * E18
+
+/// A separate account that trades through its own address and can receive ETH.
+pub msg TraderMsg {
+    #[selector = 0x01]
+    Buy { market: Address, outcome: u8, shares: u256, max_cost: u256 } -> u256,
+    #[selector = 0x02]
+    Sell { market: Address, outcome: u8, shares: u256, min_return: u256 } -> u256,
+    #[selector = 0x03]
+    Redeem { market: Address } -> u256,
+    #[selector = 0x04]
+    Resolve { market: Address, outcome: u8 },
+}
+
+pub contract Trader uses (ctx: Ctx, call: mut Call) {
+    recv TraderMsg {
+        #[payable]
+        Buy { market, outcome, shares, max_cost } -> u256
+        uses (ctx, mut call)
+        {
+            call.call(
+                addr: market,
+                gas: 3000000,
+                value: ctx.value(),
+                message: MarketMsg::Buy { outcome, shares, max_cost },
+            )
+        }
+        Sell { market, outcome, shares, min_return } -> u256
+        uses (mut call)
+        {
+            call.call(
+                addr: market,
+                gas: 3000000,
+                value: wei(0),
+                message: MarketMsg::Sell { outcome, shares, min_return },
+            )
+        }
+        Redeem { market } -> u256 uses (mut call) {
+            call.call(
+                addr: market,
+                gas: 3000000,
+                value: wei(0),
+                message: MarketMsg::Redeem {},
+            )
+        }
+        Resolve { market, outcome } uses (mut call) {
+            call.call(
+                addr: market,
+                gas: 3000000,
+                value: wei(0),
+                message: MarketMsg::Resolve { outcome },
+            )
+        }
+    }
+
+    recv {
+        #[payable]
+        _ {}
+    }
+}
+
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn opens_at_even_odds() uses (evm: mut Evm) {
+    let oracle = Address::new(0xabc)
+    let m = evm.create2<BinaryMarket>(value: wei(FUND), args: (B, oracle), salt: 0)
+    let p0: u256 = evm
+        .call(
+            addr: m,
+            gas: 3000000,
+            value: wei(0),
+            message: MarketMsg::Price { outcome: 0 },
+        )
+    assert!(p0 == E18 / 2)
+    let c4 = evm.create2<CategoricalMarket4>(value: wei(139 * E18), args: (B, oracle), salt: 1)
+    let p3: u256 = evm
+        .call(
+            addr: c4,
+            gas: 3000000,
+            value: wei(0),
+            message: MarketMsg::Price { outcome: 3 },
+        )
+    assert!(p3 == E18 / 4)
+}
+
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn buy_moves_price_and_refunds_change() uses (evm: mut Evm) {
+    let m = evm.create2<BinaryMarket>(value: wei(FUND), args: (B, evm.address()), salt: 0)
+    let t = evm.create2<Trader>(value: wei(0), args: (), salt: 1)
+    let quote: u256 = evm
+        .call(
+            addr: m,
+            gas: 3000000,
+            value: wei(0),
+            message: MarketMsg::QuoteBuy { outcome: 1, shares: 10 * E18 },
+        )
+    // 100 * ln((1 + e^0.1) / 2) = 5.1249... ether
+    assert!(quote > 5124 * E18 / 1000 && quote < 5126 * E18 / 1000)
+    let cost: u256 = evm
+        .call(
+            addr: t,
+            gas: 5000000,
+            value: ether(6),
+            message: TraderMsg::Buy { market: m, outcome: 1, shares: 10 * E18, max_cost: quote },
+        )
+    assert!(cost == quote)
+    // the trader paid exactly the cost; the rest came back
+    assert!(evm.balance(t).as_wei() == 6 * E18 - cost)
+    let p1: u256 = evm
+        .call(
+            addr: m,
+            gas: 3000000,
+            value: wei(0),
+            message: MarketMsg::Price { outcome: 1 },
+        )
+    assert!(p1 > E18 / 2)
+    let held: u256 = evm
+        .call(
+            addr: m,
+            gas: 3000000,
+            value: wei(0),
+            message: MarketMsg::SharesOf { owner: t, outcome: 1 },
+        )
+    assert!(held == 10 * E18)
+}
+
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn slippage_limit_reverts_with_custom_error() uses (evm: mut Evm) {
+    let m = evm.create2<BinaryMarket>(value: wei(FUND), args: (B, evm.address()), salt: 0)
+    let out = evm
+        .try_call(
+            addr: m,
+            gas: 3000000,
+            value: ether(6),
+            message: MarketMsg::Buy { outcome: 0, shares: 10 * E18, max_cost: 5 * E18 },
+        )
+    assert!(!out.success())
+    assert!(is_error<SlippageExceeded>(out.returndata()))
+}
+
+#[test(should_revert, balance = 1_000_000_000_000_000_000_000)]
+fn underfunded_market_cannot_open() uses (evm: mut Evm) {
+    // b ln 2 = 69.3 ether is required
+    let _m = evm.create2<BinaryMarket>(value: wei(69 * E18), args: (B, evm.address()), salt: 0)
+}
+
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn full_lifecycle_pays_winners_and_returns_surplus() uses (evm: mut Evm) {
+    let oracle = evm.create2<Trader>(value: wei(0), args: (), salt: 9)
+    let m = evm.create2<BinaryMarket>(value: wei(FUND), args: (B, oracle), salt: 0)
+    let alice = evm.create2<Trader>(value: wei(0), args: (), salt: 1)
+    let bob = evm.create2<Trader>(value: wei(0), args: (), salt: 2)
+    let a_cost: u256 = evm
+        .call(
+            addr: alice,
+            gas: 5000000,
+            value: ether(40),
+            message: TraderMsg::Buy { market: m, outcome: 1, shares: 30 * E18, max_cost: 40 * E18 },
+        )
+    let b_cost: u256 = evm
+        .call(
+            addr: bob,
+            gas: 5000000,
+            value: ether(40),
+            message: TraderMsg::Buy { market: m, outcome: 0, shares: 20 * E18, max_cost: 40 * E18 },
+        )
+    // Bob changes his mind about half of his position.
+    let b_back: u256 = evm
+        .call(
+            addr: bob,
+            gas: 5000000,
+            value: wei(0),
+            message: TraderMsg::Sell { market: m, outcome: 0, shares: 10 * E18, min_return: 0 },
+        )
+    assert!(b_back < b_cost)
+
+    // Only the oracle resolves; trading stops afterwards.
+    let not_oracle = evm
+        .try_call(
+            addr: m,
+            gas: 3000000,
+            value: wei(0),
+            message: MarketMsg::Resolve { outcome: 1 },
+        )
+    assert!(
+        !not_oracle.success() && is_error<Unauthorized>(not_oracle.returndata()),
+    )
+    let _: () = evm
+        .call(
+            addr: oracle,
+            gas: 5000000,
+            value: wei(0),
+            message: TraderMsg::Resolve { market: m, outcome: 1 },
+        )
+    let late = evm
+        .try_call(
+            addr: m,
+            gas: 3000000,
+            value: ether(1),
+            message: MarketMsg::Buy { outcome: 1, shares: E18, max_cost: E18 },
+        )
+    assert!(
+        !late.success() && is_error<MarketClosed>(late.returndata()),
+    )
+
+    // Alice's 30 winning shares pay 30 ether; Bob's losing shares pay nothing.
+    let before = evm.balance(alice).as_wei()
+    let paid: u256 = evm
+        .call(
+            addr: alice,
+            gas: 5000000,
+            value: wei(0),
+            message: TraderMsg::Redeem { market: m },
+        )
+    assert!(
+        paid == 30 * E18 && evm.balance(alice).as_wei() == before + paid,
+    )
+    let again = evm
+        .try_call(
+            addr: alice,
+            gas: 5000000,
+            value: wei(0),
+            message: TraderMsg::Redeem { market: m },
+        )
+    assert!(!again.success())
+    let lost = evm
+        .try_call(
+            addr: bob,
+            gas: 5000000,
+            value: wei(0),
+            message: TraderMsg::Redeem { market: m },
+        )
+    assert!(!lost.success())
+
+    // The sponsor (this test) takes the rest; the market ends empty.
+    let treasury = Address::new(0x7ea5)
+    let surplus: u256 = evm
+        .call(
+            addr: m,
+            gas: 3000000,
+            value: wei(0),
+            message: MarketMsg::Sweep { to: treasury },
+        )
+    assert!(surplus == FUND + a_cost + b_cost - b_back - paid)
+    assert!(evm.balance(treasury).as_wei() == surplus)
+    assert!(evm.balance(m).as_wei() == 0)
+}
+
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn cannot_sell_shares_you_do_not_hold() uses (evm: mut Evm) {
+    let m = evm
+        .create2<CategoricalMarket4>(value: wei(139 * E18), args: (B, evm.address()), salt: 0)
+    let t = evm.create2<Trader>(value: wei(0), args: (), salt: 1)
+    let _: u256 = evm
+        .call(
+            addr: t,
+            gas: 5000000,
+            value: ether(10),
+            message: TraderMsg::Buy { market: m, outcome: 2, shares: 5 * E18, max_cost: 10 * E18 },
+        )
+    let out = evm
+        .try_call(
+            addr: m,
+            gas: 3000000,
+            value: wei(0),
+            message: MarketMsg::Sell { outcome: 2, shares: E18, min_return: 0 },
+        )
+    assert!(
+        !out.success() && is_error<InsufficientShares>(out.returndata()),
+    )
+    let bad = evm
+        .try_call(
+            addr: m,
+            gas: 3000000,
+            value: wei(0),
+            message: MarketMsg::Price { outcome: 4 },
+        )
+    assert!(!bad.success() && is_error<BadOutcome>(bad.returndata()))
+}
+
+/// A trader whose ETH receive hook calls back into the market.
+msg AttackMsg {
+    #[selector = 0x10]
+    Arm { target: Address },
+    #[selector = 0x11]
+    Attack -> u256,
+}
+
+pub contract Reenterer uses (ctx: Ctx, call: mut Call) {
+    mut market: Address,
+    mut armed: bool,
+
+    recv AttackMsg {
+        Arm { target } uses (mut market, mut armed) {
+            market = target
+            armed = true
+        }
+        #[payable]
+        Attack -> u256 uses (ctx, mut call, market) {
+            call.call(
+                addr: market,
+                gas: 3000000,
+                value: ctx.value(),
+                message: MarketMsg::Buy { outcome: 0, shares: 10 * E18, max_cost: 10 * E18 },
+            )
+        }
+    }
+
+    recv {
+        #[payable]
+        _ uses (mut call, market, mut armed) {
+            // On the refund, try to sell the shares that were just bought.
+            if armed {
+                armed = false
+                let _: u256 = call
+                    .call(
+                        addr: market,
+                        gas: 3000000,
+                        value: wei(0),
+                        message: MarketMsg::Sell { outcome: 0, shares: 10 * E18, min_return: 0 },
+                    )
+            }
+        }
+    }
+}
+
+#[test(balance = 1_000_000_000_000_000_000_000)]
+fn reentrant_sell_during_refund_sees_updated_state() uses (evm: mut Evm) {
+    let m = evm.create2<BinaryMarket>(value: wei(FUND), args: (B, evm.address()), salt: 0)
+    let r = evm.create2<Reenterer>(value: wei(0), args: (), salt: 1)
+    let _: () = evm
+        .call(
+            addr: r,
+            gas: 3000000,
+            value: wei(0),
+            message: AttackMsg::Arm { target: m },
+        )
+    let start = evm.balance(m).as_wei()
+    let cost: u256 = evm
+        .call(
+            addr: r,
+            gas: 8000000,
+            value: ether(10),
+            message: AttackMsg::Attack {},
+        )
+    // The reentrant sell succeeded against the *updated* book, so the attacker
+    // just round-tripped: the market kept the spread and stayed solvent.
+    let held: u256 = evm
+        .call(
+            addr: m,
+            gas: 3000000,
+            value: wei(0),
+            message: MarketMsg::SharesOf { owner: r, outcome: 0 },
+        )
+    assert!(held == 0)
+    assert!(evm.balance(m).as_wei() >= start)
+    assert!(cost > 0)
+}

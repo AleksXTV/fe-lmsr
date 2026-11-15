@@ -1,0 +1,116 @@
+//! `lmsr` command-line quoter, compiled natively from the same `lmsr` ingot the
+//! contracts use.
+//!
+//! Reads one market per line from standard input:
+//!
+//!     N b q_0 ... q_{N-1}            (N in 2, 3, 4, 8, 16; numbers are raw 18-decimal integers)
+//!
+//! and writes one line per market:
+//!
+//!     cost cost_lower cost_upper price_0 ... price_{N-1}
+//!
+//! `tools/difftest.py` drives it with random markets and checks every number
+//! against a 60-digit reference implementation.
+use lmsr::Lmsr
+use core::fixed::Wad
+use std::io::{Read, Write, host, read_char, write_char}
+
+/// Reads the next unsigned decimal number, or `None` at end of input.
+/// `newline` is set when the number was the last on its line.
+fn read_number() -> Option<u256> uses (r: mut Read) {
+    var c = read_char()
+    while c == 32 || c == 10 || c == 13 || c == 9 {
+        c = read_char()
+    }
+    if c < 48 || c > 57 {
+        return Option::None
+    }
+    var v: u256 = 0
+    while c >= 48 && c <= 57 {
+        v = v * 10 + (c - 48).downcast().unwrap()
+        c = read_char()
+    }
+    Option::Some(v)
+}
+
+fn write_u256(_ value: u256) uses (w: mut Write) {
+    var digits: [u8; 78] = [0; 78]
+    var n: usize = 0
+    var v = value
+    if v == 0 {
+        write_char(48)
+        return
+    }
+    while v > 0 {
+        digits[n] = (v % 10).downcast_truncate()
+        v = v / 10
+        n += 1
+    }
+    while n > 0 {
+        n -= 1
+        write_char(48 + digits[n] as i32)
+    }
+}
+
+fn quote<const N: usize>(b: Wad, all: [Wad; 16])
+uses (w: mut Write) where N >= 2, N <= 16
+{
+    var q: [Wad; N] = [Wad::zero(); N]
+    var i: usize = 0
+    while i < N {
+        q[i] = all[i]
+        i += 1
+    }
+    let m = Lmsr<N>::new(b: b)
+    write_u256(m.cost(q).raw())
+    write_char(32)
+    write_u256(m.cost_lower(q).raw())
+    write_char(32)
+    write_u256(m.cost_upper(q).raw())
+    i = 0
+    while i < N {
+        write_char(32)
+        write_u256(m.price(q, i: i).raw())
+        i += 1
+    }
+    write_char(10)
+}
+
+pub fn main(argc: i32, argv: **u8) -> i32 {
+    let _ = argc
+    let _ = argv
+    var io = host()
+    with (Read = io, Write = io) {
+        var go = true
+        while go {
+            match read_number() {
+                Option::Some(n) => {
+                    let b = Wad::from_raw(read_number().unwrap())
+                    var all: [Wad; 16] = [Wad::zero(); 16]
+                    var i: u256 = 0
+                    while i < n {
+                        all[i as usize] = Wad::from_raw(read_number().unwrap())
+                        i += 1
+                    }
+                    if n == 2 {
+                        quote<2>(b: b, all: all)
+                    } else if n == 3 {
+                        quote<3>(b: b, all: all)
+                    } else if n == 4 {
+                        quote<4>(b: b, all: all)
+                    } else if n == 8 {
+                        quote<8>(b: b, all: all)
+                    } else if n == 16 {
+                        quote<16>(b: b, all: all)
+                    } else {
+                        go = false
+                    }
+                },
+                Option::None => {
+                    go = false
+                },
+            }
+        }
+    }
+    0
+}

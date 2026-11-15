@@ -1,0 +1,217 @@
+// Unit and property tests for the LMSR math. Property tests draw markets from
+// `KeccakRng` through the `Rng` effect, so every run checks the same cases and a
+// failure can be replayed from its seed.
+use ingot::{Lmsr, MAX_SHARES}
+use core::fixed::Wad
+use std::evm::random::{KeccakRng, Rng}
+
+const E18: u256 = 1_000_000_000_000_000_000
+
+fn wad(_ raw: u256) -> Wad {
+    Wad::from_raw(raw)
+}
+
+#[test]
+fn cost_at_zero_is_b_ln_n() {
+    let m = Lmsr<2>::new(b: Wad::from_int(100))
+    // 100 ln 2 = 69.314718055994530941...
+    let c = m.cost([Wad::zero(), Wad::zero()])
+    assert!(
+        c.raw() > 69314718055994530000 && c.raw() < 69314718055994531000,
+    )
+    assert!(m.funding() >= c)
+    let m4 = Lmsr<4>::new(b: Wad::from_int(100))
+    assert!(m4.price([Wad::zero(); 4], i: 1) == Wad::from_ratio(1, 4))
+}
+
+#[test]
+fn known_trade_cost() {
+    // Buying 10 shares at b = 100 from an empty binary market costs
+    // 100 ln((1 + e^0.1) / 2) = 5.124947951362... (computed with 50 digits).
+    let m = Lmsr<2>::new(b: Wad::from_int(100))
+    let c = m.buy_cost([Wad::zero(); 2], i: 0, shares: Wad::from_int(10))
+    assert!(
+        c.raw() >= 5124947951362000000 && c.raw() <= 5124947951363000000,
+    )
+}
+
+#[test(should_revert)]
+fn liquidity_below_minimum_is_rejected() {
+    let _ = Lmsr<2>::new(b: wad(999_999_999_999_999))
+}
+
+/// A random market state with `N` outcomes and shares up to `scale * b`.
+fn draw<const N: usize>(b: Wad, scale: u256) -> [Wad; N]
+uses (rng: mut Rng) where N >= 2, N <= 16
+{
+    var q: [Wad; N] = [Wad::zero(); N]
+    var i: usize = 0
+    while i < N {
+        q[i] = wad(rng.uniform(b.raw() * scale + 1))
+        i += 1
+    }
+    q
+}
+
+fn draw_b() -> Wad uses (rng: mut Rng) {
+    // 0.001 .. ~10^6, spread over orders of magnitude
+    let exp = rng.uniform(10)
+    var b = wad(1_000_000_000_000_000 + rng.uniform(9_000_000_000_000_000))
+    var k: u256 = 0
+    while k < exp {
+        b = b.mul_int(10)
+        k += 1
+    }
+    b
+}
+
+/// Buying shares and selling them straight back never makes money, from any state.
+fn round_trip<const N: usize>(cases: u256)
+uses (rng: mut Rng) where N >= 2, N <= 16
+{
+    var k: u256 = 0
+    while k < cases {
+        let b = draw_b()
+        let m = Lmsr<N>::new(b: b)
+        let q = draw<N>(b: b, scale: 20)
+        let i = rng.uniform(N as u256) as usize
+        let x = wad(rng.uniform(b.raw() * 10) + 1)
+        var after = q
+        after[i] = after[i] + x
+        assert!(
+            m.sell_return(after, i: i, shares: x) <= m.buy_cost(q, i: i, shares: x),
+        )
+        k += 1
+    }
+}
+
+#[test]
+fn property_round_trips_never_profit() {
+    var rng = KeccakRng::seeded(0x5eed)
+    with (Rng = rng) {
+        round_trip<2>(cases: 300)
+        round_trip<3>(cases: 200)
+        round_trip<8>(cases: 100)
+    }
+}
+
+/// `C(q) >= max_i q_i`: the cost function always covers the largest payout.
+/// This is the lemma the market's solvency rests on.
+fn covers_payout<const N: usize>(cases: u256)
+uses (rng: mut Rng) where N >= 2, N <= 16
+{
+    var k: u256 = 0
+    while k < cases {
+        let b = draw_b()
+        let m = Lmsr<N>::new(b: b)
+        let q = draw<N>(b: b, scale: 60)
+        var worst = Wad::zero()
+        for x in q {
+            worst = worst.max(x)
+        }
+        assert!(m.cost_upper(q) >= worst)
+        k += 1
+    }
+}
+
+#[test]
+fn property_cost_covers_largest_payout() {
+    var rng = KeccakRng::seeded(0xc0ffee)
+    with (Rng = rng) {
+        covers_payout<2>(cases: 300)
+        covers_payout<4>(cases: 200)
+        covers_payout<16>(cases: 50)
+    }
+}
+
+/// Prices are probabilities: each in [0, 1], summing to 1 within N wei,
+/// and buying an outcome raises its price and lowers every other.
+fn prices_behave<const N: usize>(cases: u256)
+uses (rng: mut Rng) where N >= 2, N <= 16
+{
+    var k: u256 = 0
+    while k < cases {
+        let b = draw_b()
+        let m = Lmsr<N>::new(b: b)
+        let q = draw<N>(b: b, scale: 10)
+        var sum = Wad::zero()
+        var j: usize = 0
+        while j < N {
+            let p = m.price(q, i: j)
+            assert!(p <= Wad::one())
+            sum = sum + p
+            j += 1
+        }
+        assert!(
+            sum <= Wad::one() && Wad::one() - sum <= wad(N as u256 + 1),
+        )
+        let i = rng.uniform(N as u256) as usize
+        var after = q
+        after[i] = after[i] + wad(b.raw() / 10 + 1)
+        j = 0
+        while j < N {
+            if j == i {
+                assert!(m.price(after, i: j) >= m.price(q, i: j))
+            } else {
+                assert!(m.price(after, i: j) <= m.price(q, i: j))
+            }
+            j += 1
+        }
+        k += 1
+    }
+}
+
+#[test]
+fn property_prices_are_probabilities() {
+    var rng = KeccakRng::seeded(0xbeef)
+    with (Rng = rng) {
+        prices_behave<2>(cases: 200)
+        prices_behave<4>(cases: 100)
+    }
+}
+
+/// Splitting a purchase never makes it cheaper: two half orders together cost
+/// at least the true price of the whole, so order splitting cannot beat the
+/// rounding.
+fn no_split_discount<const N: usize>(cases: u256)
+uses (rng: mut Rng) where N >= 2, N <= 16
+{
+    var k: u256 = 0
+    while k < cases {
+        let b = draw_b()
+        let m = Lmsr<N>::new(b: b)
+        let q = draw<N>(b: b, scale: 10)
+        let i = rng.uniform(N as u256) as usize
+        let x = wad(rng.uniform(b.raw() * 5) + 2)
+        let half = wad(x.raw() / 2)
+        var mid = q
+        mid[i] = mid[i] + half
+        var end = q
+        end[i] = end[i] + x
+        let split = m.buy_cost(q, i: i, shares: half) + m.buy_cost(mid, i: i, shares: x - half)
+        // true cost of the whole order is at most cost_upper(end) - cost_lower(q)
+        assert!(
+            split + m.error_bound().mul_int(4) >= m.buy_cost(q, i: i, shares: x),
+        )
+        assert!(split >= m.cost_lower(end).saturating_sub(m.cost_upper(q)))
+        k += 1
+    }
+}
+
+#[test]
+fn property_splitting_orders_gives_no_discount() {
+    var rng = KeccakRng::seeded(0x5911)
+    with (Rng = rng) {
+        no_split_discount<2>(cases: 200)
+        no_split_discount<4>(cases: 100)
+    }
+}
+
+#[test]
+fn largest_supported_market_is_finite() {
+    let m = Lmsr<16>::new(b: Wad::from_ratio(1, 1000))
+    var q: [Wad; 16] = [Wad::zero(); 16]
+    q[3] = MAX_SHARES
+    assert!(m.cost(q) >= MAX_SHARES)
+    assert!(m.price(q, i: 3) == Wad::one())
+}
